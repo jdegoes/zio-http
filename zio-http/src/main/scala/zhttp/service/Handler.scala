@@ -133,7 +133,7 @@ private[zhttp] final case class Handler[R](
             res =>
               if (self.isWebSocket(res)) UIO(self.upgradeToWebSocket(ctx, jReq, res))
               else {
-                (for {
+                for {
                   _ <- UIO {
                     // Write the initial line and the header.
                     unsafeWriteAndFlushAnyResponse(res)
@@ -146,10 +146,8 @@ private[zhttp] final case class Handler[R](
                       }
                     case _                             => UIO(ctx.flush())
                   }
-                } yield ()).ensuring(
-                  // This is done to prevent memory leak due to unreleased request content byteBuf, in case of failure of writeStreamContent effect.
-                  UIO(releaseRequest(jReq)),
-                )
+                  _ <- Task(releaseRequest(jReq))
+                } yield ()
               },
           )
         }
@@ -161,11 +159,7 @@ private[zhttp] final case class Handler[R](
           // Write the initial line and the header.
           unsafeWriteAndFlushAnyResponse(res)
           res.data match {
-            case HttpData.BinaryStream(stream) =>
-              unsafeRunZIO(
-                // This is done to prevent memory leak due to unreleased request content byteBuf, in case of failure of writeStreamContent effect.
-                writeStreamContent(stream).ensuring(UIO(releaseRequest(jReq))),
-              )
+            case HttpData.BinaryStream(stream) => unsafeRunZIO(writeStreamContent(stream) *> Task(releaseRequest(jReq)))
             case HttpData.File(file)           =>
               unsafeWriteFileContent(file)
             case _                             => releaseRequest(jReq)
@@ -216,7 +210,7 @@ private[zhttp] final case class Handler[R](
     stream: ZStream[Any, Throwable, ByteBuf],
   )(implicit ctx: Ctx): ZIO[Any, Throwable, Unit] = {
     for {
-      _ <- stream.foreach(c => UIO(ctx.writeAndFlush(c))).catchAll(e => UIO(exceptionCaught(ctx, e)))
+      _ <- stream.foreach(c => UIO(ctx.writeAndFlush(c)))
       _ <- ChannelFuture.unit(ctx.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT))
     } yield ()
   }
