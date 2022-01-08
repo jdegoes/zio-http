@@ -168,6 +168,7 @@ private[zhttp] final case class Handler[R](
               )
             case HttpData.File(file)           =>
               unsafeWriteFileContent(file)
+              releaseRequest(jReq)
             case _                             => releaseRequest(jReq)
           }
         }
