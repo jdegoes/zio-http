@@ -16,24 +16,26 @@ import java.util.{Base64, UUID}
  * A `Middleware` represents the implementation of a `MiddlewareSpec`,
  * intercepting parts of the request, and appending to the response.
  */
-sealed trait Middleware[-R, I, O] { self =>
+sealed trait Middleware[-R] { self =>
+  type Input
+  type Output
   type State
 
   /**
-   * Processes an incoming request, whose relevant parts are encoded into `I`,
-   * the middleware input, and then returns an effect that will produce both
-   * middleware-specific state (which will be passed to the outgoing handlerr),
-   * together with a decision about whether to continue or abort the handling of
-   * the request.
+   * Processes an incoming request, whose relevant parts are encoded into
+   * `Input`, the middleware input, and then returns an effect that will produce
+   * both middleware-specific state (which will be passed to the outgoing
+   * handlerr), together with a decision about whether to continue or abort the
+   * handling of the request.
    */
-  def incoming(in: I): ZIO[R, Nothing, Middleware.Control[State]]
+  def incoming(in: Input): ZIO[R, Nothing, Middleware.Control[State]]
 
   /**
    * Processes an outgoing response together with the middleware state (produced
-   * by the incoming handler), returning an effect that will produce `O`, which
-   * will in turn be used to patch the response.
+   * by the incoming handler), returning an effect that will produce `Output`,
+   * which will in turn be used to patch the response.
    */
-  def outgoing(state: State, response: Response): ZIO[R, Nothing, O]
+  def outgoing(state: State, response: Response): ZIO[R, Nothing, Output]
 
   /**
    * Applies the middleware to an `HttpApp`, returning a new `HttpApp` with the
@@ -61,13 +63,18 @@ sealed trait Middleware[-R, I, O] { self =>
       } yield response
     }
 
-  def ++[R1 <: R, I2, O2](that: Middleware[R1, I2, O2])(implicit
-    inCombiner: Combiner[I, I2],
-    outCombiner: Combiner[O, O2],
-  ): Middleware[R1, inCombiner.Out, outCombiner.Out] =
-    Middleware.Concat[R1, I, O, I2, O2, inCombiner.Out, outCombiner.Out](self, that, inCombiner, outCombiner)
+  def ++[R1 <: R](that: Middleware[R1])(implicit
+    inCombiner: Combiner[self.Input, that.Input],
+    outCombiner: Combiner[self.Output, that.Output],
+  ): Middleware[R1] =
+    Middleware.Concat[R1, Input, Output, that.Input, that.Output, inCombiner.Out, outCombiner.Out](
+      self,
+      that,
+      inCombiner,
+      outCombiner,
+    )
 
-  def spec: MiddlewareSpec[I, O]
+  def spec: MiddlewareSpec[Input, Output]
 }
 
 object Middleware {
@@ -92,9 +99,9 @@ object Middleware {
     final case class Abort[State](state: State, patch: Response => Response) extends Control[State]
   }
 
-  def intercept[S, R, I, O](spec: MiddlewareSpec[I, O])(incoming: I => Control[S])(
-    outgoing: (S, Response) => O,
-  ): Middleware[R, I, O] =
+  def intercept[S, R, Input, Output](spec: MiddlewareSpec[Input, Output])(incoming: Input => Control[S])(
+    outgoing: (S, Response) => Output,
+  ): Middleware[R] =
     interceptZIO(spec)(i => ZIO.succeedNow(incoming(i)))((s, r) => ZIO.succeedNow(outgoing(s, r)))
 
   def interceptZIO[S]: Interceptor1[S] = new Interceptor1[S]
@@ -102,23 +109,23 @@ object Middleware {
   /**
    * Sets cookie in response headers
    */
-  def addCookie(cookie: Cookie[Response]): Middleware[Any, Unit, Cookie[Response]] =
+  def addCookie(cookie: Cookie[Response]): Middleware[Any] =
     fromFunction(MiddlewareSpec.addCookie)(_ => cookie)
 
-  def addCookieZIO[R](cookie: ZIO[R, Nothing, Cookie[Response]]): Middleware[R, Unit, Cookie[Response]] =
+  def addCookieZIO[R](cookie: ZIO[R, Nothing, Cookie[Response]]): Middleware[R] =
     fromFunctionZIO(MiddlewareSpec.addCookie)(_ => cookie)
 
   /**
    * Creates a middleware for basic authentication
    */
-  final def basicAuth(f: Auth.Credentials => Boolean)(implicit trace: Trace): Middleware[Any, String, Unit] =
+  final def basicAuth(f: Auth.Credentials => Boolean)(implicit trace: Trace): Middleware[Any] =
     basicAuthZIO(credentials => ZIO.succeed(f(credentials)))
 
   /**
    * Creates a middleware for basic authentication that checks if the
    * credentials are same as the ones given
    */
-  final def basicAuth(u: String, p: String)(implicit trace: Trace): Middleware[Any, String, Unit] =
+  final def basicAuth(u: String, p: String)(implicit trace: Trace): Middleware[Any] =
     basicAuth { credentials => (credentials.uname == u) && (credentials.upassword == p) }
 
   /**
@@ -127,7 +134,7 @@ object Middleware {
    */
   def basicAuthZIO[R](f: Auth.Credentials => ZIO[R, Nothing, Boolean])(implicit
     trace: Trace,
-  ): Middleware[R, String, Unit] =
+  ): Middleware[R] =
     customAuthZIO(HeaderCodec.authorization, Headers(HttpHeaderNames.WWW_AUTHENTICATE, BasicSchemeName)) { encoded =>
       val indexOfBasic = encoded.indexOf(BasicSchemeName)
       if (indexOfBasic != 0 || encoded.length == BasicSchemeName.length) ZIO.succeed(false)
@@ -148,7 +155,7 @@ object Middleware {
    * @param f
    *   : function that validates the token string inside the Bearer Header
    */
-  final def bearerAuth(f: String => Boolean)(implicit trace: Trace): Middleware[Any, String, Unit] =
+  final def bearerAuth(f: String => Boolean)(implicit trace: Trace): Middleware[Any] =
     bearerAuthZIO(token => ZIO.succeed(f(token)))
 
   /**
@@ -161,7 +168,7 @@ object Middleware {
    */
   final def bearerAuthZIO[R](
     f: String => ZIO[R, Nothing, Boolean],
-  )(implicit trace: Trace): Middleware[R, String, Unit] =
+  )(implicit trace: Trace): Middleware[R] =
     customAuthZIO(
       HeaderCodec.authorization,
       responseHeaders = Headers(HttpHeaderNames.WWW_AUTHENTICATE, BearerSchemeName),
@@ -177,9 +184,9 @@ object Middleware {
    * Creates an authentication middleware that only allows authenticated
    * requests to be passed on to the app.
    */
-  def customAuth[R, I](headerCodec: HeaderCodec[I])(
-    verify: I => Boolean,
-  ): Middleware[R, I, Unit] =
+  def customAuth[R, Input](headerCodec: HeaderCodec[Input])(
+    verify: Input => Boolean,
+  ): Middleware[R] =
     customAuthZIO(headerCodec)(header => ZIO.succeed(verify(header)))
 
   /**
@@ -187,11 +194,11 @@ object Middleware {
    * requests to be passed on to the app using an effectful verification
    * function.
    */
-  def customAuthZIO[R, I](
-    headerCodec: HeaderCodec[I],
+  def customAuthZIO[R, Input](
+    headerCodec: HeaderCodec[Input],
     responseHeaders: Headers = Headers.empty,
     responseStatus: Status = Status.Unauthorized,
-  )(verify: I => ZIO[R, Nothing, Boolean])(implicit trace: Trace): Middleware[R, I, Unit] =
+  )(verify: Input => ZIO[R, Nothing, Boolean])(implicit trace: Trace): Middleware[R] =
     MiddlewareSpec.customAuth(headerCodec).implementIncomingControl { in =>
       verify(in).map {
         case true  => Middleware.Control.Continue(())
@@ -273,7 +280,7 @@ object Middleware {
   final def csrfGenerate[R, E](
     tokenName: String = "x-csrf-token",
     tokenGen: ZIO[R, Nothing, String] = ZIO.succeed(UUID.randomUUID.toString)(Trace.empty),
-  )(implicit trace: Trace): api.Middleware[R, Unit, Cookie[Response]] = {
+  )(implicit trace: Trace): api.Middleware[R] = {
     api.Middleware.addCookieZIO(tokenGen.map(Cookie(tokenName, _)))
   }
 
@@ -287,7 +294,7 @@ object Middleware {
    *
    * https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html#double-submit-cookie
    */
-  def csrfValidate(tokenName: String = "x-csrf-token"): Middleware[Any, CsrfValidate, Unit] =
+  def csrfValidate(tokenName: String = "x-csrf-token"): Middleware[Any] =
     MiddlewareSpec
       .csrfValidate(tokenName)
       .implement {
@@ -300,47 +307,54 @@ object Middleware {
 
   def fromFunction[A, B](spec: MiddlewareSpec[A, B])(
     f: A => B,
-  ): Middleware[Any, A, B] =
+  ): Middleware[Any] =
     intercept(spec)((a: A) => Control.Continue(a))((a, _) => f(a))
 
   def fromFunctionZIO[R, A, B](spec: MiddlewareSpec[A, B])(
     f: A => ZIO[R, Nothing, B],
-  ): Middleware[R, A, B] =
+  ): Middleware[R] =
     interceptZIO(spec)((a: A) => ZIO.succeedNow(Control.Continue(a)))((a, _) => f(a))
 
-  val none: Middleware[Any, Unit, Unit] =
+  val none: Middleware[Any] =
     fromFunction(MiddlewareSpec.none)(_ => ())
 
   class Interceptor1[S](val dummy: Boolean = true) extends AnyVal {
-    def apply[R, I, O](spec: MiddlewareSpec[I, O])(
-      incoming: I => ZIO[R, Nothing, Control[S]],
-    ): Interceptor2[S, R, I, O] =
-      new Interceptor2[S, R, I, O](spec, incoming)
+    def apply[R, Input, Output](spec: MiddlewareSpec[Input, Output])(
+      incoming: Input => ZIO[R, Nothing, Control[S]],
+    ): Interceptor2[S, R, Input, Output] =
+      new Interceptor2[S, R, Input, Output](spec, incoming)
   }
 
-  class Interceptor2[S, R, I, O](spec: MiddlewareSpec[I, O], incoming: I => ZIO[R, Nothing, Control[S]]) {
-    def apply[R1 <: R, E](outgoing: (S, Response) => ZIO[R1, Nothing, O]): Middleware[R1, I, O] =
+  class Interceptor2[S, R, Input, Output](
+    spec: MiddlewareSpec[Input, Output],
+    incoming: Input => ZIO[R, Nothing, Control[S]],
+  ) {
+    def apply[R1 <: R, E](outgoing: (S, Response) => ZIO[R1, Nothing, Output]): Middleware[R1] =
       InterceptZIO(spec, incoming, outgoing)
   }
 
-  private[api] final case class InterceptZIO[S, R, I, O](
-    spec: MiddlewareSpec[I, O],
-    incoming0: I => ZIO[R, Nothing, Control[S]],
-    outgoing0: (S, Response) => ZIO[R, Nothing, O],
-  ) extends Middleware[R, I, O] {
-    type State = S
+  private[api] final case class InterceptZIO[S, R, Input0, Output0](
+    spec: MiddlewareSpec[Input0, Output0],
+    incoming0: Input0 => ZIO[R, Nothing, Control[S]],
+    outgoing0: (S, Response) => ZIO[R, Nothing, Output0],
+  ) extends Middleware[R] {
+    type Input  = Input0
+    type Output = Output0
+    type State  = S
 
-    def incoming(in: I): ZIO[R, Nothing, Middleware.Control[State]] = incoming0(in)
+    def incoming(in: Input): ZIO[R, Nothing, Middleware.Control[State]] = incoming0(in)
 
-    def outgoing(state: State, response: Response): ZIO[R, Nothing, O] = outgoing0(state, response)
+    def outgoing(state: State, response: Response): ZIO[R, Nothing, Output] = outgoing0(state, response)
   }
   private[api] final case class Concat[-R, I1, O1, I2, O2, I3, O3](
-    left: Middleware[R, I1, O1],
-    right: Middleware[R, I2, O2],
+    left: Middleware[R] { type Input = I1; type Output = O1 },
+    right: Middleware[R] { type Input = I2; type Output = O2 },
     inCombiner: Combiner.WithOut[I1, I2, I3],
     outCombiner: Combiner.WithOut[O1, O2, O3],
-  ) extends Middleware[R, I3, O3] {
-    type State = (left.State, right.State)
+  ) extends Middleware[R] {
+    type Input  = I3
+    type Output = O3
+    type State  = (left.State, right.State)
 
     def incoming(in: I3): ZIO[R, Nothing, Middleware.Control[State]] = {
       val (l, r) = inCombiner.separate(in)

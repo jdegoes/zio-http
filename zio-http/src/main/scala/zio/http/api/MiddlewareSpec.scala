@@ -27,12 +27,12 @@ final case class MiddlewareSpec[MiddlewareIn, MiddlewareOut](
 
   def implementIncoming[R](
     incoming: MiddlewareIn => ZIO[R, Nothing, MiddlewareOut],
-  ): Middleware[R, MiddlewareIn, MiddlewareOut] =
+  ): Middleware[R] =
     Middleware.fromFunctionZIO(self)(incoming)
 
   def implementIncomingControl[R](
     incoming: MiddlewareIn => ZIO[R, Nothing, Middleware.Control[MiddlewareOut]],
-  ): Middleware[R, MiddlewareIn, MiddlewareOut] =
+  ): Middleware[R] =
     implement[R, MiddlewareOut](in => incoming(in))((out, _) => ZIO.succeedNow(out))
 
   def mapIn[MiddlewareIn2](

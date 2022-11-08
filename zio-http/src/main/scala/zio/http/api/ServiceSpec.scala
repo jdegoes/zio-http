@@ -24,7 +24,7 @@ sealed trait ServiceSpec[MI, MO, -AllIds] { self =>
 
   final def toHttpApp[AllIds1 <: AllIds, R, E](
     service: Endpoints[R, E, AllIds1],
-    middleware: Middleware[R, MI, MO],
+    middleware: Middleware[R],
   ): HttpApp[R, E] =
     middleware(service.toHttpApp)
 
