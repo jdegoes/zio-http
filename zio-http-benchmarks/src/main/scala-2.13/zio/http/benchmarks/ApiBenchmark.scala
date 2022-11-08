@@ -88,7 +88,7 @@ class ApiBenchmark {
   val usersPosts =
     EndpointSpec
       .get(RouteCodec.literal("users") / RouteCodec.int / "posts" / RouteCodec.int)
-      .in(QueryCodec.query("query"))
+      .query(QueryCodec.query("query"))
       .out[ExampleData]
 
   val handledUsersPosts =

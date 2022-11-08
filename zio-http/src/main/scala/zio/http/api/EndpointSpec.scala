@@ -8,16 +8,13 @@ import zio.stream.ZStream
 import zio.stacktracer.TracingImplicits.disableAutoTrace // scalafix:ok;
 
 /**
- * An [[zio.http.api.EndpointSpec]] represents an API endpoint for the HTTP
- * protocol. Every `API` has an input, which comes from a combination of the
- * HTTP path, query string parameters, and headers, and an output, which is the
- * data computed by the handler of the API.
+ * An [[zio.http.api.EndpointSpec]] represents the specification for an endpoint
+ * for the HTTP protocol. Every `EndpointSpec` has an input, which comes from a
+ * combination of the HTTP path, query string parameters, headers, and body; and
+ * an output, which is the data computed by the handler of the API and
+ * translated into the body of the response.
  *
- * MiddlewareInput : Example: A subset of `HttpCodec[Input]` that doesn't give
- * access to `Input` MiddlewareOutput: Example: A subset of `Out[Output]` that
- * doesn't give access to `Output` Input: Example: Int Output: Example: User
- *
- * As [[zio.http.api.EndpointSpec]] is a purely declarative encoding of an
+ * Because [[zio.http.api.EndpointSpec]] is a purely declarative encoding of an
  * endpoint, it is possible to use this model to generate a [[zio.http.HttpApp]]
  * (by supplying a handler for the endpoint), to generate OpenAPI documentation,
  * to generate a type-safe Scala client for the endpoint, and possibly, to
@@ -25,6 +22,7 @@ import zio.stacktracer.TracingImplicits.disableAutoTrace // scalafix:ok;
  */
 final case class EndpointSpec[Input, Output](
   input: HttpCodec[CodecType.RequestType, Input],
+  // error: HttpCodec[CodecType.ResponseType, Error],
   output: HttpCodec[CodecType.ResponseType, Output],
   doc: Doc,
 ) { self =>
@@ -79,47 +77,45 @@ final case class EndpointSpec[Input, Output](
   def ??(that: Doc): EndpointSpec[Input, Output] = copy(doc = self.doc + that)
 
   /**
-   * Converts this API, which is an abstract description of an endpoint, into a
-   * service, which is a concrete implementation of the endpoint. In order to
-   * convert an API into a service, you must specify a function which handles
-   * the input, and returns the output.
+   * Returns a new Endpoint specification with the specified header codec added
+   * to the input of this specification.
    */
-  def implement[R, E](f: Input => ZIO[R, E, Output]): Endpoints[R, E, this.type] =
-    Endpoints.HandledEndpoint[R, E, Input, Output, this.type](self, f)
-
   def header[A](codec: HeaderCodec[A])(implicit
     combiner: Combiner[Input, A],
   ): EndpointSpec[combiner.Out, Output] =
     copy(input = self.input ++ codec)
 
   /**
-   * Adds a new element of input to the API, which can come from the portion of
-   * the HTTP path not yet consumed, the query string parameters, or the HTTP
-   * headers of the request.
+   * Converts this endpoint specification into a concrete implementation of the
+   * endpoint. In order to convert a spec into an implementation, you must
+   * specify a function which handles the input, and which returns the output.
    */
-  def in[Input2](
-    in2: HttpCodec[CodecType.RequestType, Input2],
-  )(implicit
-    combiner: Combiner[Input, Input2],
-  ): EndpointSpec[combiner.Out, Output] =
-    copy(input = self.input ++ in2)
+  def implement[R, E](f: Input => ZIO[R, E, Output]): Endpoints[R, E, this.type] =
+    Endpoints.HandledEndpoint[R, E, Input, Output, this.type](self, f)
 
   /**
-   * Convert API to a ServiceSpec.
+   * Returns a new endpoint specification with the input type changed to the
+   * specified type.
    */
-  def toServiceSpec: ServiceSpec[Unit, Unit, this.type] =
-    ServiceSpec(self).middleware(MiddlewareSpec.none)
+  def in[Input2: Schema](implicit
+    combiner: Combiner[Input, Input2],
+  ): EndpointSpec[combiner.Out, Output] =
+    copy(input = self.input ++ HttpCodec.Body(implicitly[Schema[Input2]]))
+
+  /**
+   * Returns a new endpoint specification with the input type changed to a
+   * stream of the specified type.
+   */
+  def inStream[Input2: Schema](implicit
+    combiner: Combiner[Input, ZStream[Any, Throwable, Input2]],
+  ): EndpointSpec[combiner.Out, Output] =
+    copy(input = self.input ++ HttpCodec.BodyStream(implicitly[Schema[Input2]]))
 
   /**
    * Changes the output type of the endpoint to the specified output type.
    */
   def out[Output2: Schema]: EndpointSpec[Input, Output2] =
     copy(output = HttpCodec.Body(implicitly[Schema[Output2]]))
-
-  def out[Output2](out2: HttpCodec[CodecType.ResponseType, Output2])(implicit
-    combiner: Combiner[Output, Output2],
-  ): EndpointSpec[Input, combiner.Out] =
-    copy(output = output ++ out2)
 
   /**
    * Changes the output type of the endpoint to be a stream of the specified
@@ -128,15 +124,31 @@ final case class EndpointSpec[Input, Output](
   def outStream[Output2: Schema]: EndpointSpec[Input, ZStream[Any, Throwable, Output2]] =
     copy(output = HttpCodec.BodyStream(implicitly[Schema[Output2]]))
 
+  /**
+   * Returns a new Endpoint specification with the specified query codec added
+   * to the input of this specification.
+   */
   def query[A](codec: QueryCodec[A])(implicit
     combiner: Combiner[Input, A],
   ): EndpointSpec[combiner.Out, Output] =
     copy(input = self.input ++ codec)
 
+  /**
+   * Returns a new Endpoint specification with the specified route codec added
+   * to the input of this specification.
+   */
   def route[A](codec: RouteCodec[A])(implicit
     combiner: Combiner[Input, A],
   ): EndpointSpec[combiner.Out, Output] =
     copy(input = self.input ++ codec)
+
+  /**
+   * Convert API to a ServiceSpec.
+   */
+  def toServiceSpec: ServiceSpec[Unit, Unit, this.type] =
+    ServiceSpec(self).middleware(MiddlewareSpec.none)
+
+  // def toOpenAPI: zio.http.api.openapi.??? = ???
 }
 
 object EndpointSpec {
