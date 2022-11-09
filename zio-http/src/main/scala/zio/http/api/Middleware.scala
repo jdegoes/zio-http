@@ -8,7 +8,7 @@ import zio.http.middleware.Auth
 import zio.http.middleware.Cors.CorsConfig
 import zio.http.model.Headers.{BasicSchemeName, BearerSchemeName, Header}
 import zio.http.model.headers.values.Origin
-import zio.http.model.{Cookie, Headers, Method, Status}
+import zio.http.model.{Cookie, Headers, HttpError, Method, Status}
 
 import java.util.{Base64, UUID}
 
@@ -17,6 +17,7 @@ import java.util.{Base64, UUID}
  * intercepting parts of the request, and appending to the response.
  */
 sealed trait Middleware[-R] { self =>
+  type Error 
   type Input
   type Output
   type State
@@ -28,14 +29,14 @@ sealed trait Middleware[-R] { self =>
    * handlerr), together with a decision about whether to continue or abort the
    * handling of the request.
    */
-  def incoming(in: Input): ZIO[R, Nothing, Middleware.Control[State]]
+  def incoming(in: Input): ZIO[R, Option[Error], State]
 
   /**
    * Processes an outgoing response together with the middleware state (produced
    * by the incoming handler), returning an effect that will produce `Output`,
    * which will in turn be used to patch the response.
    */
-  def outgoing(state: State, response: Response): ZIO[R, Nothing, Output]
+  def outgoing(state: State): ZIO[R, Nothing, Output]
 
   /**
    * Applies the middleware to an `HttpApp`, returning a new `HttpApp` with the
@@ -44,65 +45,46 @@ sealed trait Middleware[-R] { self =>
   def apply[R1 <: R, E](httpApp: HttpApp[R1, E]): HttpApp[R1, E] =
     Http.fromOptionFunction[Request] { request =>
       for {
-        in       <- spec.middlewareIn.decodeRequest(request).orDie
-        control  <- incoming(in)
-        response <- control match {
-          case Middleware.Control.Continue(state)     =>
-            for {
-              response1 <- httpApp(request)
-              mo        <- outgoing(state, response1)
-              patch = spec.middlewareOut.encodeResponsePatch(mo)
-            } yield response1.patch(patch)
-          case Middleware.Control.Abort(state, patch) =>
+        in       <- spec.input.decodeRequest(request).orDie
+        response <- incoming(in).foldZIO({
+          case None => ZIO.fail(None)
+          case Some(error) => 
+            val patch    = spec.error.encodeResponsePatch(error)
             val response = patch(Response.ok)
 
-            outgoing(state, response)
-              .map(out => response.patch(spec.middlewareOut.encodeResponsePatch(out)))
-
-        }
+            ZIO.succeed(response)
+        },
+          state => 
+            for {
+              response1 <- httpApp(request)
+              mo        <- outgoing(state)
+              patch = spec.output.encodeResponsePatch(mo)
+            } yield response1.patch(patch)
+        )
       } yield response
     }
 
   def ++[R1 <: R](that: Middleware[R1])(implicit
     inCombiner: Combiner[self.Input, that.Input],
     outCombiner: Combiner[self.Output, that.Output],
+    errCombiner: Alternator[self.Error, that.Error]
   ): Middleware[R1] =
-    Middleware.Concat[R1, Input, Output, that.Input, that.Output, inCombiner.Out, outCombiner.Out](
+    Middleware.Concat[R1, self.Error, that.Error, errCombiner.Out, Input, Output, that.Input, that.Output, inCombiner.Out, outCombiner.Out](
       self,
       that,
       inCombiner,
       outCombiner,
+      errCombiner
     )
 
-  def spec: MiddlewareSpec[Input, Output]
+  def spec: MiddlewareSpec[Input, Error, Output]
 }
 
 object Middleware {
-  sealed trait Control[+State] { self =>
-    def ++[State2](that: Control[State2])(implicit zippable: Zippable[State, State2]): Control[zippable.Out] =
-      (self, that) match {
-        case (Control.Continue(l), Control.Continue(r))           => Control.Continue(zippable.zip(l, r))
-        case (Control.Continue(l), Control.Abort(r, rpatch))      => Control.Abort(zippable.zip(l, r), rpatch)
-        case (Control.Abort(l, lpatch), Control.Continue(r))      => Control.Abort(zippable.zip(l, r), lpatch)
-        case (Control.Abort(l, lpatch), Control.Abort(r, rpatch)) =>
-          Control.Abort(zippable.zip(l, r), lpatch.andThen(rpatch))
-      }
-
-    def map[State2](f: State => State2): Control[State2] =
-      self match {
-        case Control.Continue(state)     => Control.Continue(f(state))
-        case Control.Abort(state, patch) => Control.Abort(f(state), patch)
-      }
-  }
-  object Control               {
-    final case class Continue[State](state: State)                           extends Control[State]
-    final case class Abort[State](state: State, patch: Response => Response) extends Control[State]
-  }
-
-  def intercept[S, R, Input, Output](spec: MiddlewareSpec[Input, Output])(incoming: Input => Control[S])(
-    outgoing: (S, Response) => Output,
+  def intercept[S, R, Input, Output](spec: MiddlewareSpec[Input, _, Output])(incoming: Input => S)(
+    outgoing: S => Output,
   ): Middleware[R] =
-    interceptZIO(spec)(i => ZIO.succeedNow(incoming(i)))((s, r) => ZIO.succeedNow(outgoing(s, r)))
+    interceptZIO(spec)(i => ZIO.succeedNow(incoming(i)))(s => ZIO.succeedNow(outgoing(s)))
 
   def interceptZIO[S]: Interceptor1[S] = new Interceptor1[S]
 
@@ -135,7 +117,7 @@ object Middleware {
   def basicAuthZIO[R](f: Auth.Credentials => ZIO[R, Nothing, Boolean])(implicit
     trace: Trace,
   ): Middleware[R] =
-    customAuthZIO(HeaderCodec.authorization, Headers(HttpHeaderNames.WWW_AUTHENTICATE, BasicSchemeName)) { encoded =>
+    customAuthZIO(HeaderCodec.authorization, HeaderCodec.wwwAuthenticate) { encoded =>
       val indexOfBasic = encoded.indexOf(BasicSchemeName)
       if (indexOfBasic != 0 || encoded.length == BasicSchemeName.length) ZIO.succeed(false)
       else {
@@ -194,16 +176,12 @@ object Middleware {
    * requests to be passed on to the app using an effectful verification
    * function.
    */
-  def customAuthZIO[R, Input](
+  def customAuthZIO[R, E, Input](
     headerCodec: HeaderCodec[Input],
-    responseHeaders: Headers = Headers.empty,
-    responseStatus: Status = Status.Unauthorized,
-  )(verify: Input => ZIO[R, Nothing, Boolean])(implicit trace: Trace): Middleware[R] =
-    MiddlewareSpec.customAuth(headerCodec).implementIncomingControl { in =>
-      verify(in).map {
-        case true  => Middleware.Control.Continue(())
-        case false => Middleware.Control.Abort((), _.copy(status = responseStatus, headers = responseHeaders))
-      }
+    unauthorized: HttpCodec[CodecType.ResponseType, E]
+  )(verify: Input => ZIO[R, E, Unit])(implicit trace: Trace): Middleware[R] =
+    MiddlewareSpec.customAuth(headerCodec, unauthorized).implementIncomingControl { in =>
+      verify(in)
     }
 
   /**
@@ -249,8 +227,7 @@ object Middleware {
         ZIO
           .succeed(
             Middleware.Control.Abort(
-              (),
-              _.copy(status = Status.NoContent, headers = corsHeaders(origin, isPreflight = true)),
+              Response.Patch(setStatus = Some(Status.NoContent), addHeaders = corsHeaders(origin, isPreflight = true)),
             ),
           )
 
@@ -258,10 +235,10 @@ object Middleware {
         ZIO
           .succeed(
             Middleware.Control
-              .Abort((), _.copy(headers = corsHeaders(origin, isPreflight = false))),
+              .Abort(Response.Patch(setStatus = None, addHeaders = corsHeaders(origin, isPreflight = false))),
           )
 
-      case _ => ZIO.succeed(Middleware.Control.Continue(()))
+      case _ => ZIO.unit
     } { case (_, _) =>
       ZIO.unit
     }
@@ -302,76 +279,79 @@ object Middleware {
           ZIO.succeedNow(Control.Continue(state))
 
         case state =>
-          ZIO.succeedNow(Control.Abort(state, _ => Response.status(Status.Forbidden)))
+          ZIO.succeedNow(Control.Abort(Response.Patch(setStatus = Some(Status.Forbidden), addHeaders = Headers.empty)))
       }((_, _) => ZIO.unit)
 
-  def fromFunction[A, B](spec: MiddlewareSpec[A, B])(
+  def fromFunction[A, B](spec: MiddlewareSpec[A, _, B])(
     f: A => B,
   ): Middleware[Any] =
     intercept(spec)((a: A) => Control.Continue(a))((a, _) => f(a))
 
-  def fromFunctionZIO[R, A, B](spec: MiddlewareSpec[A, B])(
-    f: A => ZIO[R, Nothing, B],
+  def fromFunctionZIO[R, E, A, B](spec: MiddlewareSpec[A, E, B])(
+    f: A => ZIO[R, E, B],
   ): Middleware[R] =
-    interceptZIO(spec)((a: A) => ZIO.succeedNow(Control.Continue(a)))((a, _) => f(a))
+    interceptZIO(spec)(f)(ZIO.succeedNow(_))
 
   val none: Middleware[Any] =
     fromFunction(MiddlewareSpec.none)(_ => ())
 
   class Interceptor1[S](val dummy: Boolean = true) extends AnyVal {
-    def apply[R, Input, Output](spec: MiddlewareSpec[Input, Output])(
-      incoming: Input => ZIO[R, Nothing, Control[S]],
-    ): Interceptor2[S, R, Input, Output] =
-      new Interceptor2[S, R, Input, Output](spec, incoming)
+    def apply[R, E, Input, Output](spec: MiddlewareSpec[Input, E, Output])(
+      incoming: Input => ZIO[R, E, S],
+    ): Interceptor2[S, R, E, Input, Output] =
+      new Interceptor2[S, R, E, Input, Output](spec, incoming)
   }
 
-  class Interceptor2[S, R, Input, Output](
-    spec: MiddlewareSpec[Input, Output],
-    incoming: Input => ZIO[R, Nothing, Control[S]],
+  class Interceptor2[S, R, E, Input, Output](
+    spec: MiddlewareSpec[Input, E, Output],
+    incoming: Input => ZIO[R, E, Control[S]],
   ) {
-    def apply[R1 <: R, E](outgoing: (S, Response) => ZIO[R1, Nothing, Output]): Middleware[R1] =
+    def apply[R1 <: R](outgoing: S => ZIO[R1, Nothing, Output]): Middleware[R1] =
       InterceptZIO(spec, incoming, outgoing)
   }
 
-  private[api] final case class InterceptZIO[S, R, Input0, Output0](
-    spec: MiddlewareSpec[Input0, Output0],
-    incoming0: Input0 => ZIO[R, Nothing, Control[S]],
-    outgoing0: (S, Response) => ZIO[R, Nothing, Output0],
+  private[api] final case class InterceptZIO[S, R, E, Input0, Output0](
+    spec: MiddlewareSpec[Input0, E, Output0],
+    incoming0: Input0 => ZIO[R, E, Control[S]],
+    outgoing0: S => ZIO[R, Nothing, Output0],
   ) extends Middleware[R] {
+    type Error = E
     type Input  = Input0
     type Output = Output0
     type State  = S
 
-    def incoming(in: Input): ZIO[R, Nothing, Middleware.Control[State]] = incoming0(in)
+    def incoming(in: Input): ZIO[R, Option[E], Middleware.Control[State]] = incoming0(in).mapError(Some(_))
 
-    def outgoing(state: State, response: Response): ZIO[R, Nothing, Output] = outgoing0(state, response)
+    def outgoing(state: State): ZIO[R, Nothing, Output] = outgoing0(state)
   }
-  private[api] final case class Concat[-R, I1, O1, I2, O2, I3, O3](
-    left: Middleware[R] { type Input = I1; type Output = O1 },
-    right: Middleware[R] { type Input = I2; type Output = O2 },
+  private[api] final case class Concat[-R, E1, E2, E3, I1, O1, I2, O2, I3, O3](
+    left: Middleware[R] { type Input = I1; type Output = O1; type Error = E1 },
+    right: Middleware[R] { type Input = I2; type Output = O2; type Error = E2 },
     inCombiner: Combiner.WithOut[I1, I2, I3],
     outCombiner: Combiner.WithOut[O1, O2, O3],
+    errCombiner: Alternator.WithOut[E1, E2, E3]
   ) extends Middleware[R] {
+    type Error  = E3 
     type Input  = I3
     type Output = O3
     type State  = (left.State, right.State)
 
-    def incoming(in: I3): ZIO[R, Nothing, Middleware.Control[State]] = {
+    def incoming(in: I3): ZIO[R, Option[Error], State] = {
       val (l, r) = inCombiner.separate(in)
 
       for {
-        leftControl  <- left.incoming(l)
-        rightControl <- right.incoming(r)
-      } yield leftControl ++ rightControl
+        leftState  <- left.incoming(l).mapError(_.flatMap(errCombiner.left(_)))
+        rightState <- right.incoming(r).mapError(_.map(errCombiner.right(_)))
+      } yield (leftState, rightState)
     }
 
-    def outgoing(state: State, response: Response): ZIO[R, Nothing, O3] =
+    def outgoing(state: State): ZIO[R, Nothing, O3] =
       for {
-        l <- left.outgoing(state._1, response)
-        r <- right.outgoing(state._2, response)
+        l <- left.outgoing(state._1)
+        r <- right.outgoing(state._2)
       } yield outCombiner.combine(l, r)
 
-    def spec: MiddlewareSpec[I3, O3] =
-      left.spec.++(right.spec)(inCombiner, outCombiner)
+    def spec: MiddlewareSpec[Input, Error, Output] =
+      left.spec.++(right.spec)(inCombiner, outCombiner, errCombiner)
   }
 }

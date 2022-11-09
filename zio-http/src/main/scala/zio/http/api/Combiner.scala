@@ -100,3 +100,60 @@ trait CombinerLowPriority4 {
       def separate(out: (A, B)): (A, B) = (out._1, out._2)
     }
 }
+
+
+sealed trait Alternator[L, R] {
+  type Out 
+
+  def left(l: L): Option[Out]
+  def right(r: R): Out 
+
+  def unleft(out: Out): Option[L]
+  def unright(out: Out): Option[R]
+}
+object Alternator extends AlternatorLowPriority1 {
+  type WithOut[L, R, O] = Alternator[L, R] { type Out = O }
+
+  implicit def leftUnit[A]: Alternator.WithOut[Unit, A, A] =
+    new Alternator[Unit, A] {
+      type Out = A
+
+      def left(l: Unit): Option[Out] = None
+
+      def right(r: A): Out = r
+
+      def unleft(out: Out): Option[Unit] = None
+
+      def unright(out: Out): Option[A] = Some(out)
+    }
+
+}
+
+trait AlternatorLowPriority1 extends AlternatorLowPriority2 {
+  implicit def merge[A]: Alternator.WithOut[A, A, A] =
+    new Alternator[A, A] {
+      type Out = A
+
+      def left(l: A): Option[Out] = Some(l)
+
+      def right(r: A): Out = r
+
+      def unleft(out: Out): Option[A] = Some(out)
+
+      def unright(out: Out): Option[A] = Some(out)
+    }
+}
+trait AlternatorLowPriority2 {
+  implicit def leftRight[A, B]: Alternator.WithOut[A, B, Either[A, B]] =
+    new Alternator[A, B] {
+      type Out = Either[A, B]
+
+      def left(l: A): Option[Out] = Some(Left(l))
+
+      def right(r: B): Out = Right(r)
+
+      def unleft(out: Out): Option[A] = out.swap.toOption
+
+      def unright(out: Out): Option[B] = out.toOption
+    }
+}

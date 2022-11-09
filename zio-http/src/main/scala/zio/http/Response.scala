@@ -116,6 +116,9 @@ final case class Response private (
 
 object Response {
   final case class Patch(addHeaders: Headers, setStatus: Option[Status]) { self =>
+    def apply(response: Response): Response = 
+      response.patch(self)
+      
     def ++(that: Patch): Patch =
       Patch(self.addHeaders ++ that.addHeaders, self.setStatus.orElse(that.setStatus))
   }
