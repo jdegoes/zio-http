@@ -17,12 +17,7 @@ class ServerInboundHandlerBenchmark {
   private val res  = ZIO.succeed(Response.ok)
   private val http = Routes(Route.route(Method.GET / "text")(handler(res))).toHttpApp
 
-  @Benchmark
-  def benchmarkApp(): Unit = {
-    zio.Unsafe.unsafe(implicit u => zio.Runtime.default.unsafe.run(benchmarkZioParallel()))
-  }
-
-  def benchmarkZioParallel() =
+  def benchmarkZioParallel(): Task[Unit] =
     (for {
       _      <- Server.serve(http).fork
       client <- ZIO.service[Client]
