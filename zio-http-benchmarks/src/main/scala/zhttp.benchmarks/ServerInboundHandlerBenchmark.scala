@@ -38,9 +38,9 @@ class ServerInboundHandlerBenchmark {
     (for {
       _ <- zio.Console.printLine("Benchmarking start")
       _ <- Server.serve(http).fork
-      _ <- zio.Console.printLine("Server started on port 8080").
+      _ <- zio.Console.printLine("Server started on port 8080")
       client <- ZIO.service[Client]
-      _ <- (ZIO.foreachPar(0.until(PAR))(_ => client.get("/text")))  .repeat(MAX / PAR)
+      _ <- (ZIO.foreachPar((0 until PAR).toList)(_ => client.get("/text"))).repeatN(MAX / PAR)
     } yield ()).provide(Server.default, ZClient.default, zio.Scope.default)
 
   @Benchmark
