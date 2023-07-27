@@ -17,36 +17,20 @@ class ServerInboundHandlerBenchmark {
   private val res  = ZIO.succeed(Response.ok)
   private val http = Routes(Route.route(Method.GET / "text")(handler(res))).toHttpApp
 
-
-  def benchmarkZio() =
-    (for {
-      _ <- zio.Console.printLine("Benchmarking start")
-      _ <- Server.serve(http).fork
-      _ <- zio.Console.printLine("Server started on port 8080")
-      client <- ZIO.service[Client]
-      _ <- client.get("/text").repeatN(MAX)
-    } yield ()).provide(Server.default, ZClient.default, zio.Scope.default)
-
   @Benchmark
   def benchmarkApp(): Unit = {
-    zio.Unsafe.unsafe(implicit u =>
-      zio.Runtime.default.unsafe.run(benchmarkZio())
-    )
+    zio.Unsafe.unsafe(implicit u => zio.Runtime.default.unsafe.run(benchmarkZioParallel()))
   }
 
   def benchmarkZioParallel() =
     (for {
-      _ <- zio.Console.printLine("Benchmarking start")
-      _ <- Server.serve(http).fork
-      _ <- zio.Console.printLine("Server started on port 8080")
+      _      <- Server.serve(http).fork
       client <- ZIO.service[Client]
-      _ <- (ZIO.foreachPar((0 until PAR).toList)(_ => client.get("/text"))).repeatN(MAX / PAR)
+      _      <- ZIO.foreachPar((0 until PAR).toList)(_ => client.get("/text")).repeatN(MAX / PAR)
     } yield ()).provide(Server.default, ZClient.default, zio.Scope.default)
 
   @Benchmark
   def benchmarkAppParallel(): Unit = {
-    zio.Unsafe.unsafe(implicit u =>
-      zio.Runtime.default.unsafe.run(benchmarkZioParallel())
-    )
+    zio.Unsafe.unsafe(implicit u => zio.Runtime.default.unsafe.run(benchmarkZioParallel()))
   }
 }
